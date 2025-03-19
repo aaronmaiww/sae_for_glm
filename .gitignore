@@ -27,3 +27,4 @@ data/processed/*
 # OS generated files
 .DS_Store
 Thumbs.db
+annotated_seqs/*.csv
