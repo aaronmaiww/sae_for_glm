@@ -12,7 +12,6 @@ venv/
 
 # Large data files
 annotated_seqs/
-*.csv
 **/*.csv
 
 # Model weights and large binary files

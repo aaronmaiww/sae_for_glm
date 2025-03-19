@@ -1,7 +1,7 @@
 # Description:
 
 # This script contains functionality to run an SAE on some data and then 
-# inspect which tokens most activate a given SA latents
+# inspect which tokens most activate a given SAE latents
 
 ### First, tools to load data
 
@@ -176,10 +176,6 @@ def extract_layer_activations_and_latents(model_nt, sae_model, tokens, layer_num
         torch.cuda.empty_cache()
         
     return all_acts, combined_latents, metrics
-
-
-
-
 
 
 def show_top_activating_tokens(token_df, latent_id, combined_latents):
