@@ -2,23 +2,27 @@
 __pycache__/
 *.py[cod]
 *.class
+
+# Virtual environment
+venv/
+.env/
+
 # Jupyter Notebooks
 .ipynb_checkpoints/
 
-# Virtual environments
-venv/
-env/
-.env/
+# Large data files
+annotated_seqs/*.csv
+annotated_seqs/**/*.csv
+*.csv
+
+# Model weights and large binary files
+*.h5
+*.pth
+*.pt
 
 # IDE settings
 .vscode/
 .idea/
-
-# Data files (large or sensitive)
-data/raw/*
-data/processed/*
-!data/raw/.gitkeep
-!data/processed/.gitkeep
 
 # Logs and databases
 *.log
@@ -27,4 +31,3 @@ data/processed/*
 # OS generated files
 .DS_Store
 Thumbs.db
-annotated_seqs/*.csv
