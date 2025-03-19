@@ -1,0 +1,14 @@
+Metadata-Version: 2.2
+Name: sae_genomics
+Version: 0.1.0
+Summary: Sparse Autoencoder for Genomic Foundation Models
+Author: Your Name
+Requires-Python: >=3.8
+License-File: LICENSE
+Requires-Dist: torch
+Requires-Dist: numpy
+Requires-Dist: pandas
+Dynamic: author
+Dynamic: requires-dist
+Dynamic: requires-python
+Dynamic: summary
