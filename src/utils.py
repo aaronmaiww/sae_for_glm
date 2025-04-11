@@ -1,359 +1,28 @@
-import pandas as pd
-import torch
-from typing import List, Dict, Optional, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.cuda.amp import autocast, GradScaler
 import h5py
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
-from tqdm import tqdm
 import threading
 import queue
-from torch.cuda.amp import autocast, GradScaler
 import wandb
 import os
+import pandas as pd
+from torch.utils.data import Dataset, DataLoader, Subset
+from tqdm import tqdm
+from typing import List, Dict, Optional, Any, Tuple
+
+
 
 ### SAE ARCHs
 
-
-class JumpReLU(torch.autograd.Function):
-    """
-    JumpReLU with straight-through estimator for gradient through the discontinuity.
-    Following Rajamanoharan et al (2024) approach but allowing gradient to flow to all parameters.
-    """
-    @staticmethod
-    def forward(ctx, x, threshold):
-        """Forward pass applies threshold: output = x if x > threshold else 0"""
-        ctx.save_for_backward(x, threshold)
-        return torch.where(x > threshold, x, torch.zeros_like(x))
-    
-    @staticmethod
-    def backward(ctx, grad_output):
-        """Backward pass with straight-through estimator"""
-        x, threshold = ctx.saved_tensors
-        # Gradient of 1 where x > threshold, 0 otherwise
-        grad_x = grad_output.clone()
-        grad_x = torch.where(x > threshold, grad_x, torch.zeros_like(grad_x))
-        
-        # Epsilon for the window around the threshold
-        epsilon = 2.0
-        
-        # Compute gradient with respect to threshold
-        # STE is non-zero in a narrow window around the threshold
-        window_mask = (x - threshold).abs() < (epsilon / 2)
-        grad_threshold = torch.zeros_like(threshold)
-        if window_mask.any():
-            # For points near the threshold, provide a gradient signal
-            grad_threshold = -threshold * window_mask.float() * grad_output / epsilon
-        
-        return grad_x, grad_threshold
-
-class AnthropicsAutoEncoder(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-        d_mlp = cfg["d_mlp"]                         # Input/output dimension
-        d_hidden = cfg["d_mlp"] * cfg["dict_mult"]   # Hidden layer dimension
-        dtype = cfg.get("enc_dtype", torch.float32)  # Data type
-        
-        # Sparsity hyperparameters
-        self.sparsity_coeff = cfg.get("l0_coeff", 1.0)   # Lambda_S
-        self.preact_coeff = cfg.get("preact_coeff", 3e-6) # Lambda_P
-        self.c = cfg.get("tanh_scaling", 4.0)            # Tanh scaling factor
-        self.epsilon = cfg.get("epsilon", 2.0)           # Gradient window width
-        
-        # Initialize log threshold parameter
-        initial_threshold = cfg.get("activation_threshold", 0.1)
-        self.log_threshold = nn.Parameter(torch.full(
-            (d_hidden,), math.log(initial_threshold), dtype=dtype
-        ))
-        
-        # Initialize weights with careful initialization
-        # Decoder initialization from U(-1/n, 1/n)
-        self.W_dec = nn.Parameter(
-            torch.empty(d_hidden, d_mlp, dtype=dtype).uniform_(-1/d_mlp, 1/d_mlp)
-        )
-        
-        # Encoder initialization from W_dec^T with scaling n/m
-        self.W_enc = nn.Parameter(
-            (d_mlp/d_hidden) * self.W_dec.t().clone()
-        )
-        
-        # Initialize biases
-        self.b_dec = nn.Parameter(torch.zeros(d_mlp, dtype=dtype))
-        self.b_enc = nn.Parameter(torch.zeros(d_hidden, dtype=dtype))
-        
-        # Store dimensions and device
-        self.d_mlp = d_mlp
-        self.d_hidden = d_hidden
-        self.to("cuda")
-        
-        # Feature activation tracking
-        self.register_buffer("feature_activation_count", torch.zeros(d_hidden))
-        self.register_buffer("total_samples_seen", torch.tensor(0))
-        
-        print(f"Initialized ImprovedAutoEncoder with dimensions: {d_mlp} -> {d_hidden} -> {d_mlp}")
-        print(f"Sparsity coefficient: {self.sparsity_coeff}, Pre-activation coefficient: {self.preact_coeff}")
-    
-    def _normalize_decoder(self):
-        """Normalize decoder columns to unit L2 norm"""
-        with torch.no_grad():
-            norm = self.W_dec.norm(dim=1, keepdim=True)
-            self.W_dec.data = self.W_dec / norm
-    
-    def calculate_bias_for_activation_rate(self, data_sample, target_rate=1/10000):
-        """
-        Examine a data subset to pick encoder bias values that achieve
-        a target activation rate per feature.
-        """
-        with torch.no_grad():
-            # Forward pass through encoder without bias
-            pre_acts_no_bias = data_sample @ self.W_enc.t()
-            
-            # Find threshold for each feature to achieve target activation rate
-            target_percentile = 100 * (1 - target_rate)
-            thresholds = torch.tensor([
-                torch.quantile(col, target_percentile/100) 
-                for col in pre_acts_no_bias.t()
-            ])
-            
-            # Set bias to negative of these thresholds
-            return -thresholds
-    
-    def initialize_bias_from_data(self, dataloader, max_batches=10, input_key='input_ids'):
-        """Initialize encoder bias based on actual data distribution"""
-        sample_data = []
-        for i, batch in enumerate(dataloader):
-            if i >= max_batches:
-                break
-            if isinstance(batch, (tuple, list)):
-                x = batch[0].to(self.W_enc.device)
-            elif isinstance(batch, dict):
-                # Handle dictionary inputs - try common keys
-                if input_key in batch:
-                    x = batch[input_key].to(self.W_enc.device)
-                elif 'x' in batch:
-                    x = batch['x'].to(self.W_enc.device)
-                elif 'inputs' in batch:
-                    x = batch['inputs'].to(self.W_enc.device)
-                else:
-                    # Try the first value in the dictionary
-                    x = next(iter(batch.values())).to(self.W_enc.device)
-            else:
-                x = batch.to(self.W_enc.device)
-            
-            sample_data.append(x)
-        
-        if not sample_data:
-            raise ValueError("No data could be extracted from the dataloader")
-        
-        sample_data = torch.cat(sample_data, dim=0) 
-        # Center the data as we do in forward pass
-        sample_data = (sample_data - sample_data.mean(dim=1, keepdim=True))
-        sample_data = sample_data / sample_data.std(dim=1, keepdim=True)
-        
-        # Calculate appropriate bias values
-        bias_values = self.calculate_bias_for_activation_rate(sample_data)
-        self.b_enc.data = bias_values
-        print(f"Initialized encoder bias for approximately 10,000 active features per datapoint")
-    
-    def forward(self, x):
-        """Forward pass with JumpReLU and sparsity objectives"""
-        with torch.amp.autocast('cuda'):
-            # Ensure x is float and normalize
-            x = x.float()
-            x = (x - x.mean(dim=1, keepdim=True)) / (x.std(dim=1, keepdim=True) + 1e-5)
-            
-            # Store original for loss calculation
-            x_orig = x
-            
-            # Encoding
-            pre_acts = torch.addmm(self.b_enc, x - self.b_dec, self.W_enc)
-            
-            # Calculate threshold (exp of log threshold)
-            threshold = torch.exp(self.log_threshold)
-            
-            # Apply JumpReLU activation
-            acts = JumpReLU.apply(pre_acts, threshold)
-            
-            # Track active features for analysis
-            with torch.no_grad():
-                active_feats = (acts > 0).float()
-                self.feature_activation_count += active_feats.sum(dim=0)
-                self.total_samples_seen += x.shape[0]
-            
-            # Decoding
-            x_reconstruct = torch.addmm(self.b_dec, acts, self.W_dec)
-            
-            # Calculate reconstruction loss
-            l2_loss = F.mse_loss(x_reconstruct, x_orig, reduction='none').sum(dim=1).mean()
-            
-            # Calculate normalized MSE for monitoring
-            with torch.no_grad():
-                nmse = torch.norm(x_orig - x_reconstruct, p=2) / torch.norm(x_orig, p=2)
-            
-            # Calculate sparsity loss - tanh of feature size
-            feat_size = acts.abs() * torch.norm(self.W_dec, dim=1)**2
-            sparsity_loss = torch.tanh(self.c * feat_size).sum(dim=1).mean()
-            
-            # Calculate pre-activation loss (penalty for inactive features)
-            preact_penalty = F.relu(threshold - pre_acts) * torch.norm(self.W_dec, dim=1)**2
-            preact_loss = preact_penalty.sum(dim=1).mean()
-            
-            # Calculate L0 and L1 norms for monitoring
-            with torch.no_grad():
-                true_l0 = (acts > 0).float().sum(dim=1).mean()
-                l1_loss = acts.abs().sum(dim=1).mean()
-            
-            # Total loss
-            loss = l2_loss + self.sparsity_coeff * sparsity_loss + self.preact_coeff * preact_loss
-            
-            return loss, x_reconstruct, acts, l2_loss, nmse, l1_loss, true_l0
-    
-    @torch.no_grad()
-    def remove_parallel_component_of_grads(self):
-        """
-        Maintain unit norm constraint by removing the parallel component 
-        of gradients to maintain the normalization.
-        """
-        if self.W_dec.grad is not None:
-            # Normalize W_dec
-            W_dec_normed = self.W_dec / self.W_dec.norm(dim=1, keepdim=True)
-            
-            # Calculate component of gradient parallel to normalized W_dec
-            W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(1, keepdim=True) * W_dec_normed
-            
-            # Remove parallel component from gradient
-            self.W_dec.grad -= W_dec_grad_proj
-    
-    def get_activation_stats(self):
-        """Return statistics about feature activations"""
-        if self.total_samples_seen == 0:
-            return {"avg_active_features": 0, "feature_use_ratio": 0}
-        
-        # Calculate average number of active features per sample
-        avg_active = self.feature_activation_count.sum() / self.total_samples_seen
-        
-        # Calculate what fraction of features are being used
-        active_ratio = (self.feature_activation_count > 0).float().mean()
-        
-        return {"avg_active_features": avg_active.item(), 
-                "feature_use_ratio": active_ratio.item()}
-    
-    def reset_activation_stats(self):
-        """Reset the activation statistics"""
-        self.feature_activation_count.zero_()
-        self.total_samples_seen.zero_()
-    
-    @torch.no_grad()
-    def normalize_for_analysis(self):
-        """
-        Return a model with identical predictions but normalized
-        columns in W_dec (unit L2 norm).
-        """
-        new_model = ImprovedAutoEncoder({"d_mlp": self.d_mlp, "dict_mult": self.d_hidden // self.d_mlp})
-        
-        # Calculate norms for decoder columns
-        W_dec_norm = self.W_dec.norm(dim=1, keepdim=True)
-        
-        # Copy and normalize parameters
-        new_model.W_enc.data = self.W_enc * W_dec_norm.t()
-        new_model.b_enc.data = self.b_enc * W_dec_norm.squeeze()
-        new_model.W_dec.data = self.W_dec / W_dec_norm
-        new_model.b_dec.data = self.b_dec.clone()
-        new_model.log_threshold.data = self.log_threshold.clone()
-        
-        return new_model
-
-# Optimizer setup function
-def setup_training(model, lr=2e-4, warmup_steps=1000, total_steps=10000, 
-                   final_sparsity_coeff=20.0, weight_decay=0.0):
-    """Configure optimizer and learning rate/sparsity schedules"""
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr, 
-                                 betas=(0.9, 0.999), eps=1e-8,
-                                 weight_decay=weight_decay)
-    
-    # Learning rate scheduler with linear warmup and decay
-    def lr_lambda(step):
-        if step < warmup_steps:
-            return step / warmup_steps  # Linear warmup
-        else:
-            # Linear decay over the last 20% of training
-            decay_start = int(0.8 * total_steps)
-            if step <= decay_start:
-                return 1.0
-            else:
-                return max(0.0, (total_steps - step) / (total_steps - decay_start))
-    
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
-    # Sparsity coefficient warmup function (linear increase)
-    def get_sparsity_coeff(step):
-        return min(final_sparsity_coeff, (step / total_steps) * final_sparsity_coeff)
-    
-    return optimizer, lr_scheduler, get_sparsity_coeff
-
-# Training step function
-def training_step(model, batch, optimizer, get_sparsity_coeff, step, clip_grad_norm=1.0, input_key='input_ids'):
-    """Perform one training step with adaptive sparsity coefficient"""
-    # Update sparsity coefficient
-    model.sparsity_coeff = get_sparsity_coeff(step)
-    
-    # Extract inputs from batch (could be tensor, tuple, dict, etc.)
-    if isinstance(batch, dict):
-        if input_key in batch:
-            inputs = batch[input_key].to(model.W_enc.device)
-        elif 'x' in batch:
-            inputs = batch['x'].to(model.W_enc.device)
-        elif 'inputs' in batch:
-            inputs = batch['inputs'].to(model.W_enc.device)
-        else:
-            # Try the first value in the dictionary
-            inputs = next(iter(batch.values())).to(model.W_enc.device)
-    elif isinstance(batch, (tuple, list)):
-        inputs = batch[0].to(model.W_enc.device)
-    else:
-        inputs = batch.to(model.W_enc.device)
-    
-    # Zero gradients
-    optimizer.zero_grad()
-    
-    # Forward pass
-    loss, reconstructions, acts, l2_loss, nmse, l1_loss, true_l0 = model(inputs)
-    
-    # Backward pass
-    loss.backward()
-    
-    # Remove parallel component of gradients to maintain unit-norm constraint
-    model.remove_parallel_component_of_grads()
-    
-    # Clip gradients
-    torch.nn.utils.clip_grad_norm_(model.parameters(), clip_grad_norm)
-    
-    # Update weights
-    optimizer.step()
-    
-    # Return metrics
-    metrics = {
-        "total_loss": loss.item(),
-        "l2_loss": l2_loss.item(),
-        "nmse": nmse.item(),
-        "l1": l1_loss.item(),
-        "l0": true_l0.item(),
-        "sparsity_coeff": model.sparsity_coeff
-    }
-    
-    return metrics
-
-
-
 class AutoEncoder(nn.Module):
-    def __init__(self, cfg):
+    def __init__(self, cfg: Dict[str, Any]):
         super().__init__()
         d_hidden = cfg["d_mlp"] * cfg["dict_mult"]
         d_mlp = cfg["d_mlp"]
-        self.l0_coeff = cfg.get("l0_coeff", 1)  # Let's print this in init
-        #print(f"Initializing with l0_coeff: {self.l0_coeff}")
+        self.l0_coeff = cfg.get("l0_coeff", 1)  
         self.threshold = cfg.get("activation_threshold", 0.3)
         self.temperature = cfg.get("temperature", 0.05) # changed from 1 to 0.05
         dtype = cfg["enc_dtype"]
@@ -367,23 +36,24 @@ class AutoEncoder(nn.Module):
         self.d_hidden = d_hidden
         self.to("cuda")
 
-    def get_continuous_l0(self, x):
+    def get_continuous_l0(self, x: torch.Tensor) -> torch.Tensor:
         """Debug L0 calculation"""
         abs_x = x.abs()
         shifted = abs_x - self.threshold
         proxy = torch.sigmoid(shifted / self.temperature)
         return proxy
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         with torch.amp.autocast('cuda'):
-
+            
+            # Check for empty or single-element tensors
+            if x.numel() <= 1:
+                raise ValueError(f"Input tensor is empty or has only one element (shape: {x.shape}, numel: {x.numel()}). This will cause issues with normalization.")
+            
             x = x.float()
-            # Add diagnostics
 
              # Add normalization
-            x = (x - x.mean()) / x.std()  # or use running statistics
-
-
+            x = (x - x.mean()) / (x.std() + 1e-5)  # Add epsilon for stability
 
             # Encoding
             pre_acts = torch.addmm(self.b_enc, x - self.b_dec, self.W_enc)
@@ -400,7 +70,7 @@ class AutoEncoder(nn.Module):
             # Decoding
             x_reconstruct = torch.addmm(self.b_dec, acts_sparse, self.W_dec)
 
-            # Losses
+            # Get Losses
             l2_loss = F.mse_loss(x_reconstruct.float(), x.float(), reduction='none')
             l2_loss = l2_loss.sum(-1)
             l2_loss = l2_loss.mean()
@@ -415,31 +85,65 @@ class AutoEncoder(nn.Module):
             loss = l2_loss + self.l0_coeff * true_l0
 
         return loss, x_reconstruct, acts_sparse, l2_loss, nmse, l1_loss, true_l0
+    
     @torch.no_grad()
     def remove_parallel_component_of_grads(self):
+        """
+        Remove the parallel component of the gradients of W_dec.
+        So that each decoder vector is updated with an orthogonal gradient.
+        To do: explain 
+        """
+       
         if self.W_dec.grad is not None:
             W_dec_normed = self.W_dec / self.W_dec.norm(dim=-1, keepdim=True)
             W_dec_grad_proj = (self.W_dec.grad * W_dec_normed).sum(-1, keepdim=True) * W_dec_normed
             self.W_dec.grad -= W_dec_grad_proj
 
 
-### Train SAE
+### Train & Val SAE
 
-def train_sae(sae_model, dataset, batch_size, num_epochs, learning_rate, device, start_chunk, wandb_log=False, save_dir='checkpoints'):
+def train_sae(sae_model: nn.Module,  # The SAE model to train
+              dataset: Dataset,  # The dataset to train on
+              batch_size: int,  # Batch size for training
+              num_epochs: int,  # Number of epochs to train 
+              learning_rate: float,  # Learning rate for the optimizer 
+              device: str,  # Device to run training on (e.g., 'cuda' or 'cpu') 
+              start_chunk: int = 0,  # Which chunk to start training from 
+              wandb_log: bool = False,  # Whether to log metrics to wandb
+              save_dir: str = 'checkpoints',  # Directory to save checkpoints
+) -> nn.Module:
+
+    
     if not os.path.exists(save_dir):
         os.makedirs(save_dir)
-
+    
     sae_model = sae_model.to(device)
     optimizer = torch.optim.AdamW(sae_model.parameters(), lr=learning_rate)
     scaler = torch.amp.GradScaler('cuda')
 
+    # To save best model later
     best_loss = float('inf')
     
     # Calculate total number of batches across all chunks for proper progress bar
     num_chunks = (len(dataset) + dataset.chunk_size - 1) // dataset.chunk_size
-    total_samples = len(dataset) - (start_chunk * dataset.chunk_size)
-    total_batches_per_epoch = (total_samples + batch_size - 1) // batch_size
+    total_batches_per_epoch = 0
 
+    for chunk_idx in range(start_chunk, num_chunks):
+        chunk_start = chunk_idx * dataset.chunk_size
+        chunk_end = min(chunk_start + dataset.chunk_size, len(dataset))
+        chunk_indices = range(chunk_start, chunk_end)
+
+        chunk_loader = DataLoader(
+            Subset(dataset, chunk_indices),
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=0,
+            pin_memory=False
+        )
+        total_batches_per_epoch += len(chunk_loader) # get the correct number of batches from the dataloader.
+
+    
+    # Start training
     for epoch in range(num_epochs):
         epoch_metrics = {'loss': 0.0, 'l2_loss': 0.0, 'l1_loss': 0.0, 'l0_loss': 0.0, 'nmse': 0.0}
         processed_batches = 0
@@ -466,9 +170,19 @@ def train_sae(sae_model, dataset, batch_size, num_epochs, learning_rate, device,
             for batch_idx, batch in enumerate(chunk_loader):
                 batch = batch.to(device, non_blocking=True)
 
+                # Add before the forward pass
+                if torch.isnan(batch).any():
+                    print("NaN detected in input batch")
+                    continue
+
                 # Forward pass
                 with torch.amp.autocast('cuda'):
                     loss, x_reconstruct, acts, l2_loss, nmse, l1_loss, l0_loss = sae_model(batch)
+                
+                # Add after the forward pass
+                if torch.isnan(x_reconstruct).any():
+                    print("NaN detected in reconstruction")
+                    continue
 
                 # Clear gradients
                 optimizer.zero_grad(set_to_none=True)
@@ -551,6 +265,275 @@ def train_sae(sae_model, dataset, batch_size, num_epochs, learning_rate, device,
 
     return sae_model
 
+def validate_sae(sae_model: nn.Module, 
+                 dataset: Dataset, 
+                 batch_size: int, 
+                 device: str, 
+                 start_chunk: int =0, 
+                 num_chunks: Optional[int] = None,
+                 wandb_log: bool = False) -> Dict[str, float]:
+    """
+    Validate a trained SAE model on a validation dataset.
+    Similar to train_sae but without the training/optimization steps.
+
+    """
+    sae_model = sae_model.to(device)
+    sae_model.eval()  # Set model to evaluation mode
+    
+   # Calculate total number of chunks and respect the num_chunks limit if provided
+    total_chunks = (len(dataset) + dataset.chunk_size - 1) // dataset.chunk_size
+    end_chunk = min(total_chunks, start_chunk + num_chunks) if num_chunks is not None else total_chunks
+    
+    # Calculate total samples and batches to process
+    total_samples = min(len(dataset) - (start_chunk * dataset.chunk_size), 
+                         dataset.chunk_size * (end_chunk - start_chunk))
+    total_batches = (total_samples + batch_size - 1) // batch_size
+    
+    # Initialize metrics
+    val_metrics = {'loss': 0.0, 'l2_loss': 0.0, 'l1_loss': 0.0, 'l0_loss': 0.0, 'nmse': 0.0}
+    processed_batches = 0
+    
+    # Create progress bar for the entire validation
+    pbar = tqdm(total=end_chunk, desc=f"Validating SAE")
+    
+    for chunk_idx in range(start_chunk, end_chunk):
+        torch.cuda.empty_cache()
+        
+        chunk_start = chunk_idx * dataset.chunk_size
+        chunk_end = min(chunk_start + dataset.chunk_size, len(dataset))
+        chunk_indices = range(chunk_start, chunk_end)
+        
+        chunk_loader = DataLoader(
+            torch.utils.data.Subset(dataset, chunk_indices),
+            batch_size=batch_size,
+            shuffle=False,  # No need to shuffle for validation
+            num_workers=0,
+            pin_memory=False
+        )
+        
+        # Process batches in this chunk
+        for batch_idx, batch in enumerate(chunk_loader):
+            batch = batch.to(device, non_blocking=True)
+            
+            # Skip batches with NaN values
+            if torch.isnan(batch).any():
+                print("NaN detected in input batch - skipping")
+                continue
+            
+            # Forward pass
+            with torch.no_grad():  # No need to track gradients for validation
+                with torch.amp.autocast('cuda'):
+                    loss, x_reconstruct, acts, l2_loss, nmse, l1_loss, l0_loss = sae_model(batch)
+            
+            # Skip if reconstruction has NaN values
+            if torch.isnan(x_reconstruct).any():
+                print("NaN detected in reconstruction - skipping")
+                continue
+            
+            # Record metrics
+            metrics = {
+                'loss': loss.item(),
+                'l2_loss': l2_loss.item(),
+                'l1_loss': l1_loss.item(),
+                'l0_loss': l0_loss.item(),
+                'nmse': nmse.item()
+            }
+            
+            # Update running metrics
+            for k, v in metrics.items():
+                val_metrics[k] += v
+            processed_batches += 1
+            
+            # Update progress bar with latest metrics
+            pbar.set_postfix({k: f"{v/processed_batches:.4f}" for k, v in val_metrics.items()})
+            pbar.update(1)
+            
+            # Clean up
+            del loss, x_reconstruct, acts, l2_loss, nmse, l1_loss, l0_loss, batch
+            torch.cuda.empty_cache()
+        
+        # End of chunk cleanup
+        del chunk_loader
+        torch.cuda.empty_cache()
+    
+    # Close progress bar
+    pbar.close()
+    
+    # Calculate and return averages
+    avg_metrics = {k: v/processed_batches for k, v in val_metrics.items()} if processed_batches > 0 else val_metrics
+    
+    # Print summary
+    print(f"\nValidation Summary:")
+    for k, v in avg_metrics.items():
+        print(f"Average {k}: {v:.4f}")
+    
+    # Log to wandb if requested
+    if wandb_log:
+        wandb.log({
+            'val_loss': avg_metrics['loss'],
+            'val_l2_loss': avg_metrics['l2_loss'],
+            'val_l1_loss': avg_metrics['l1_loss'],
+            'val_l0_loss': avg_metrics['l0_loss'],
+            'val_nmse': avg_metrics['nmse'],
+        })
+    
+    return avg_metrics
+
+
+def run_sae(sae_model: nn.Module, 
+            dataset: Dataset, 
+            batch_size: int, 
+            device: str, 
+            start_chunk: int = 0, 
+            num_chunks: Optional[int] = None, 
+            return_activations: bool = True, 
+            return_reconstructions: bool = True) -> Dict[str, Any]:
+    """
+    Run a trained SAE model on a dataset and collect outputs.
+    Similar to validate_sae but returns the model outputs instead of just metrics.
+    
+    Args:
+        sae_model: The SAE model to run
+        dataset: The dataset to process
+        batch_size: Batch size for processing
+        device: Device to run on
+        start_chunk: Which chunk to start from
+        num_chunks: How many chunks to process (None for all)
+        return_activations: Whether to return the activations
+        return_reconstructions: Whether to return the reconstructions
+        
+    Returns:
+        Dictionary containing collected outputs and metrics
+    """
+    sae_model = sae_model.to(device)
+    sae_model.eval()  # Set model to evaluation mode
+    
+    # Calculate total number of chunks and respect the num_chunks limit if provided
+    total_chunks = (len(dataset) + dataset.chunk_size - 1) // dataset.chunk_size
+    end_chunk = min(total_chunks, start_chunk + num_chunks) if num_chunks is not None else total_chunks
+    
+    # Calculate total samples to process
+    total_samples = min(len(dataset) - (start_chunk * dataset.chunk_size), 
+                         dataset.chunk_size * (end_chunk - start_chunk))
+    
+    # Initialize output containers
+    outputs = {
+        'metrics': {'loss': 0.0, 'l2_loss': 0.0, 'l1_loss': 0.0, 'l0_loss': 0.0, 'nmse': 0.0},
+        'sample_indices': [],
+    }
+    
+    if return_activations:
+        outputs['activations'] = []
+    
+    if return_reconstructions:
+        outputs['reconstructions'] = []
+        outputs['inputs'] = []
+    
+    processed_batches = 0
+    processed_samples = 0
+    
+    # Create progress bar for the entire run
+    pbar = tqdm(total=end_chunk - start_chunk, desc=f"Running SAE")
+    
+    for chunk_idx in range(start_chunk, end_chunk):
+        torch.cuda.empty_cache()
+        
+        chunk_start = chunk_idx * dataset.chunk_size
+        chunk_end = min(chunk_start + dataset.chunk_size, len(dataset))
+        chunk_indices = range(chunk_start, chunk_end)
+        
+        chunk_loader = DataLoader(
+            torch.utils.data.Subset(dataset, chunk_indices),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False
+        )
+        
+        # Process batches in this chunk
+        for batch_idx, batch in enumerate(chunk_loader):
+            batch = batch.to(device, non_blocking=True)
+            
+            # Skip batches with NaN values
+            if torch.isnan(batch).any():
+                print("NaN detected in input batch - skipping")
+                continue
+            
+            # Forward pass
+            with torch.no_grad():  # No need to track gradients
+                with torch.amp.autocast('cuda'):
+                    loss, x_reconstruct, acts, l2_loss, nmse, l1_loss, l0_loss = sae_model(batch)
+            
+            # Skip if reconstruction has NaN values
+            if torch.isnan(x_reconstruct).any():
+                print("NaN detected in reconstruction - skipping")
+                continue
+            
+            # Record metrics
+            batch_metrics = {
+                'loss': loss.item(),
+                'l2_loss': l2_loss.item(),
+                'l1_loss': l1_loss.item(),
+                'l0_loss': l0_loss.item(),
+                'nmse': nmse.item()
+            }
+            
+            # Update running metrics
+            for k, v in batch_metrics.items():
+                outputs['metrics'][k] += v
+            
+            # Store batch size for calculating averages later
+            processed_batches += 1
+            batch_size_actual = batch.shape[0]
+            processed_samples += batch_size_actual
+            
+            # Store sample indices
+            start_idx = chunk_start + batch_idx * batch_size
+            batch_indices = list(range(start_idx, start_idx + batch_size_actual))
+            outputs['sample_indices'].extend(batch_indices)
+            
+            # Store activations if requested
+            if return_activations:
+                outputs['activations'].append(acts.detach().cpu())
+            
+            # Store reconstructions and inputs if requested
+            if return_reconstructions:
+                outputs['reconstructions'].append(x_reconstruct.detach().cpu())
+                outputs['inputs'].append(batch.detach().cpu())
+            
+            # Update progress bar with latest metrics
+            pbar.set_postfix({k: f"{v/processed_batches:.4f}" for k, v in outputs['metrics'].items()})
+        
+        # End of chunk processing
+        pbar.update(1)
+        
+        # Clean up
+        del chunk_loader
+        torch.cuda.empty_cache()
+    
+    # Close progress bar
+    pbar.close()
+    
+    # Calculate average metrics
+    if processed_batches > 0:
+        outputs['metrics'] = {k: v/processed_batches for k, v in outputs['metrics'].items()}
+    
+    # Convert lists of tensors to single tensors
+    if return_activations:
+        outputs['activations'] = torch.cat(outputs['activations'], dim=0)
+    
+    if return_reconstructions:
+        outputs['reconstructions'] = torch.cat(outputs['reconstructions'], dim=0)
+        outputs['inputs'] = torch.cat(outputs['inputs'], dim=0)
+    
+    # Print summary
+    print(f"\nRun Summary:")
+    print(f"Processed {processed_samples} samples")
+    for k, v in outputs['metrics'].items():
+        print(f"Average {k}: {v:.4f}")
+    
+    return outputs
+
 ##### ACTIVATION EXTRACTION
 
 def get_layer_activations(model, input_ids, attention_mask=None, layer_N=11, model_name = 'NT'):
@@ -609,6 +592,134 @@ def get_residual_activations(model, input_ids, attention_mask=None, layer_N=11, 
         hook.remove()
         
     return activations
+
+
+def extract_layer_activations_and_latents(model_nt, sae_model, tokens, layer_num, batch_size=32, device='cuda'):
+    """
+    Extract MLP activations and corresponding SAE latent representations.
+    """
+    # Validate layer number
+    max_layers = len(model_nt.esm.encoder.layer)
+    if layer_num >= max_layers:
+        raise ValueError(f"Layer number {layer_num} is out of range. Model has {max_layers} layers.")
+
+    # Get model dimensions
+    d_mlp = model_nt.config.hidden_size
+    
+    # Calculate batch information
+    total_tokens = tokens['input_ids'].shape[0] * tokens['input_ids'].shape[1]
+    num_seqs = tokens['input_ids'].shape[0]
+    num_batches = (num_seqs + batch_size - 1) // batch_size
+
+    print(f"Total tokens: {total_tokens}, num_batches: {num_batches}")
+
+    all_latents = []
+    all_acts = []
+    metrics = {
+        'loss': 0.0,
+        'l2_loss': 0.0,
+        'nmse': 0.0,
+        'l1_loss': 0.0,
+        'true_l0': 0.0,
+        'num_samples': 0
+    }
+
+    # Ensure models are in eval mode
+    sae_model.eval()
+    model_nt.eval()
+    
+    model_nt = model_nt.to(device)
+    sae_model = sae_model.to(device)
+
+    # Print model and input details for debugging
+    print(f"SAE Model input expected shape: {sae_model.W_enc.shape}")
+    print(f"d_mlp: {d_mlp}")
+
+    # Process batches with progress bar
+    try:
+        for i in tqdm(range(num_batches), desc="Processing batches", unit="batch"):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_seqs)
+
+            # Reshape tokens for current batch
+            batch_input_ids = tokens['input_ids'][start_idx:end_idx].to(device)
+            batch_attention_mask = tokens['attention_mask'][start_idx:end_idx].to(device)
+
+
+            with torch.no_grad():
+                with autocast():
+                    # Get MLP activations
+                    try:
+                        mlp_act = get_layer_activations(
+                            model_nt,
+                            batch_input_ids,
+                            batch_attention_mask,
+                            layer_N=layer_num
+                        )
+
+                       
+                        # Additional error checking
+                        if mlp_act is None or len(mlp_act) == 0 or mlp_act[0].numel() == 0:
+                            print(f"No or empty activations retrieved for batch {i}")
+                            continue
+
+                        mlp_act = mlp_act[0].reshape(-1, d_mlp)
+                        
+                      
+                        # Check for empty tensors after reshaping
+                        if mlp_act.numel() == 0:
+                            print(f"Empty tensor after reshaping in batch {i}")
+                            continue
+
+                        
+                        # Forward pass through SAE
+                        loss, x_reconstruct, latents, l2_loss, nmse, l1_loss, true_l0 = sae_model(mlp_act)
+
+                        # Check latents before appending
+                        if latents.numel() == 0:
+                            print(f"Empty latents in batch {i}")
+                            continue
+                            
+                        all_latents.append(latents)
+                        all_acts.append(mlp_act)
+                        
+                        # Accumulate metrics
+                        metrics['loss'] += loss.item() * batch_size
+                        metrics['l2_loss'] += l2_loss.item() * batch_size  
+                        metrics['nmse'] += nmse.item() * batch_size
+                        metrics['l1_loss'] += l1_loss.item() * batch_size
+                        metrics['true_l0'] += true_l0.item() * batch_size
+                        metrics['num_samples'] += batch_size
+
+                    except Exception as e:
+                        print(f"Error processing batch {i}: {e}")
+                        continue
+
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        raise
+
+    finally:
+        # Check if we collected any activations
+        if not all_acts or not all_latents:
+            raise ValueError("No activations or latents were collected. Check your input data and model.")
+
+        # Finalize metrics
+        for key in metrics:
+            if key != 'num_samples':
+                metrics[key] = metrics[key] / metrics['num_samples'] if metrics['num_samples'] > 0 else 0
+
+        # Combine results, move to cpu before
+        all_acts = torch.cat(all_acts, dim=0).cpu()
+        all_latents = [x.cpu() for x in all_latents]
+        combined_latents = torch.cat(all_latents, dim=0).cpu()
+        
+        # Clean up
+        torch.cuda.empty_cache()
+        
+    return all_acts, combined_latents, metrics
+
+
 
 
 

@@ -25,7 +25,7 @@ def measure_monosemanticity_across_latents(
     Parameters:
     -----------
     latent_dict : dict
-        Dictionary mapping latent IDs to semantic annotations.
+        Dictionary mapping latent IDs to functional annotations.
     combined_latents : torch.Tensor
         Tensor containing activation values for all latent units.
     token_df : pd.DataFrame
@@ -44,17 +44,26 @@ def measure_monosemanticity_across_latents(
     """
     # Process each latent unit and collect results
     results_list = [
-        process_single_latent(latent_id, annotation_entry, combined_latents, token_df, 
-                             compute_metrics_across_thresholds, print_metrics, validation_set, optimal_thresholds_dict)
+        process_single_latent(latent_id, 
+                             annotation_entry, 
+                             combined_latents, 
+                             token_df, 
+                             compute_metrics_across_thresholds, 
+                             print_metrics, 
+                             validation_set, 
+                             optimal_thresholds_dict)
         for latent_id, annotation_entry in latent_dict.items()
     ]
     
+    # results_list is a list of dictionaries
     # Convert to DataFrame
     results_df = pd.DataFrame(results_list)
     
     # Sort results if the DataFrame is not empty
     f1_column = f'best_f1_val{validation_set}'
+
     if not results_df.empty and f1_column in results_df.columns:
+        # Sort by F1 score
         results_df = results_df.sort_values(by=f1_column, ascending=False).reset_index(drop=True)
     
     return results_df
@@ -70,26 +79,28 @@ def process_single_latent(
     validation_set: int = 0,
     optimal_thresholds_dict: dict = None
 ) -> dict:
-    """Process a single latent unit and return its metrics."""
+    """For single latent, calculate F1-scores acorss thresholds and return its metrics."""
     
-    # Default values
+    # Default values to return in case of errors or exceptions
     best_f1 = 0.0
     best_threshold = 0.0
     error_msg = None
 
+    # to-do: maybe un-nest these try-except blocks
     try:
         # Extract activation values for this specific latent unit
         activation_values = combined_latents[:, latent_id]
         
         # Create dataframe with activations
         token_df_copy = token_df.copy()
+
+        # Create a new column for the activation values
         token_df_copy[f"latent-{latent_id}-act"] = activation_values.cpu().detach().numpy()
         
-      
-        # Compute metrics
         # If prev computed, use best act threshold here
         optimal_thresholds = list(optimal_thresholds_dict[latent_id]) if optimal_thresholds_dict else None
 
+        # Compute metrics
         try:
             results = compute_metrics_across_thresholds(
                 token_df_copy, 
@@ -107,6 +118,7 @@ def process_single_latent(
         
         # Get best result based on F1 score
         best_result = _get_best_result(results, latent_id, annotation_entry)
+        
         if best_result:
             best_threshold, best_f1 = best_result[0], best_result[3]
             
@@ -136,8 +148,8 @@ def compute_metrics_across_thresholds(token_df: pd.DataFrame,
     Computes precision, recall, and F1 scores across different activation thresholds.
 
     Args:
-        token_df: DataFrame with token data
-        annotation: list
+        token_df: DataFrame with token data 
+        annotation: list of annotations that we calc metrics for
         latent_id: ID of the latent being analyzed
         thresholds: List of activation thresholds to evaluate
         modified_recall: Whether to use the modified recall method
@@ -146,7 +158,6 @@ def compute_metrics_across_thresholds(token_df: pd.DataFrame,
         List of tuples (threshold, precision, recall, f1)
     """
     # Preprocess data
-
 
     if modified_recall:
         try:
@@ -164,9 +175,7 @@ def compute_metrics_across_thresholds(token_df: pd.DataFrame,
                 print(f"ERROR: modified_df is not a DataFrame")
                 
         except Exception as e:
-            print(f"Exception in preprocessing: {str(e)}")
-            print("Falling back to original dataframe")
-            modified_df = token_df.copy()
+            raise ValueError(f"Error in preprocess_annotation_data_for_modrecall: {e}")
     else:
         modified_df = token_df.copy()
 
@@ -204,10 +213,15 @@ def compute_metrics_across_thresholds(token_df: pd.DataFrame,
 
 
 # Helper function (ensure this is used in the apply calls above)
-def check_annotation_match(token_anns, target_anns):
+def check_annotation_match(token_anns: List[str],
+                           target_anns: List[str],
+                           ) -> int:
+
     if not isinstance(token_anns, (list, set)):
         return 0
-    return 1 if any(ann in token_anns for ann in target_anns) else 0
+    
+    match = 1 if any(ann in token_anns for ann in target_anns) else 0
+    return match
 
 
 
@@ -330,13 +344,16 @@ def analyze_latents_fast(combined_latents: torch.Tensor,
     return latent_dict
 
 
-def process_latent_batch(combined_latents, batch_start, batch_end, device):
-    """Extract and process a batch of latents."""
+def process_latent_batch(combined_latents: torch.Tensor, 
+                         batch_start: int, 
+                         batch_end: int, 
+                         device) -> np.ndarray:
+    """Extract a batch of SAE latent activations."""
     batch_latents = combined_latents[:, batch_start:batch_end].to(device)
     return batch_latents.cpu().detach().numpy()
 
 
-def get_top_activations(batch_latents, top_n):
+def get_top_activations(batch_latents: np.ndarray, top_n: int) -> Tuple(np.ndarray, np.ndarray):
     """Find indices and values of top activating tokens for each latent."""
     # Get the indices of the top_n activations for each latent
     top_n_indices = np.argsort(-batch_latents, axis=0)[:top_n, :]

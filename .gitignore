@@ -30,3 +30,7 @@ annotated_seqs/
 # OS generated files
 .DS_Store
 Thumbs.db
+data/
+sae_weights/
+docs/
+notebooks/
