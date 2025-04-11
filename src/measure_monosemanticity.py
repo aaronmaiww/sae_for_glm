@@ -6,6 +6,7 @@ import torch
 from tqdm import tqdm
 import gc
 from sklearn.metrics import f1_score, precision_score, recall_score
+from typing import List, Dict, Set, Union, Any
 import re
 
 
@@ -15,7 +16,8 @@ def measure_monosemanticity_across_latents(
     token_df: pd.DataFrame, 
     compute_metrics_across_thresholds: callable, 
     print_metrics: callable = None, 
-    validation_set: int = 0
+    validation_set: int = 0,
+    optimal_thresholds_dict: dict = None
 ) -> pd.DataFrame:
     """
     Measures monosemanticity metrics for latent representations.
@@ -43,7 +45,7 @@ def measure_monosemanticity_across_latents(
     # Process each latent unit and collect results
     results_list = [
         process_single_latent(latent_id, annotation_entry, combined_latents, token_df, 
-                             compute_metrics_across_thresholds, print_metrics, validation_set)
+                             compute_metrics_across_thresholds, print_metrics, validation_set, optimal_thresholds_dict)
         for latent_id, annotation_entry in latent_dict.items()
     ]
     
@@ -65,7 +67,8 @@ def process_single_latent(
     token_df: pd.DataFrame,
     compute_metrics_across_thresholds: callable,
     print_metrics: callable = None,
-    validation_set: int = 0
+    validation_set: int = 0,
+    optimal_thresholds_dict: dict = None
 ) -> dict:
     """Process a single latent unit and return its metrics."""
     
@@ -83,19 +86,18 @@ def process_single_latent(
         token_df_copy[f"latent-{latent_id}-act"] = activation_values.cpu().detach().numpy()
         
       
-        print("compute metrics...")
         # Compute metrics
+        # If prev computed, use best act threshold here
+        optimal_thresholds = list(optimal_thresholds_dict[latent_id]) if optimal_thresholds_dict else None
 
         try:
-            print("About to call compute_metrics...")
             results = compute_metrics_across_thresholds(
                 token_df_copy, 
                 annotation_entry, 
                 latent_id, 
-                thresholds=None, 
+                thresholds=optimal_thresholds,
                 modified_recall=True
             )
-            print("compute_metrics returned successfully")
         except Exception as e:
             print(f"Exception in compute_metrics: {e}")
    
@@ -104,9 +106,7 @@ def process_single_latent(
             print_metrics(results)
         
         # Get best result based on F1 score
-        print(f"DEBUG: Calling _get_best_result with results length: {len(results)}")
         best_result = _get_best_result(results, latent_id, annotation_entry)
-        print(f"DEBUG: _get_best_result returned: {best_result}")
         if best_result:
             best_threshold, best_f1 = best_result[0], best_result[3]
             
@@ -117,7 +117,7 @@ def process_single_latent(
     # Prepare result dictionary
     result = {
         'latent_id': latent_id,
-        'annotation': str(annotation_entry),
+        'annotation': annotation_entry,
         f'best_f1_val{validation_set}': best_f1,
         'threshold': best_threshold
     }
@@ -146,20 +146,18 @@ def compute_metrics_across_thresholds(token_df: pd.DataFrame,
         List of tuples (threshold, precision, recall, f1)
     """
     # Preprocess data
-    print(f"Starting compute_metrics with annotation: {annotation}")
 
 
     if modified_recall:
         try:
-            print("About to call preprocess function...")
+            # here we reduce the df, such that for each sequence, we only keep the token
+            # with the highest activation. We use this only to calculate recall
+            # motivated by wanting to measure how well annotated *regions* are covered, rather than ind tokens
             modified_df = preprocess_annotation_data_for_modrecall(token_df, annotation, latent_id)
-            print("Preprocess function returned successfully")
             
             # Verify the dataframe
-            print(f"modified_df type: {type(modified_df)}")
             if isinstance(modified_df, pd.DataFrame):
-                print(f"modified_df shape: {modified_df.shape}")
-                print(f"modified_df columns: {modified_df.columns}")
+            
                 if f"latent-{latent_id}-act" not in modified_df.columns:
                     print(f"WARNING: Activation column missing from modified_df")
             else:
@@ -172,7 +170,6 @@ def compute_metrics_across_thresholds(token_df: pd.DataFrame,
     else:
         modified_df = token_df.copy()
 
-    print("Generate Thresholds...")
     if thresholds is None:
         if f"latent-{latent_id}-act" not in token_df.columns or token_df.empty:
             print(f"WARNING: Column latent-{latent_id}-act is missing or empty.")
@@ -180,7 +177,6 @@ def compute_metrics_across_thresholds(token_df: pd.DataFrame,
           
       
         max_act = round(max(token_df[f"latent-{latent_id}-act"]))
-        print(f"Max activation: {max_act}, Activation Stats:\n{token_df[f'latent-{latent_id}-act'].describe()}")
 
         # Ensure at least one threshold exists
         thresholds = range(0, max(1, max_act))
@@ -193,18 +189,26 @@ def compute_metrics_across_thresholds(token_df: pd.DataFrame,
         pred_recall = (modified_df[f"latent-{latent_id}-act"] > threshold).astype(int)
 
         # Generate ground truth masks
-        true_precision = token_df['token_annotations'].apply(lambda x: 1 if annotation in x else 0)
-        true_recall = modified_df['token_annotations'].apply(lambda x: 1 if annotation in x else 0)
+        truth_precision = token_df['token_annotations'].apply(lambda x: check_annotation_match(x, annotation))
+        truth_recall = modified_df['token_annotations'].apply(lambda x: check_annotation_match(x, annotation))
 
         # Compute metrics
-        precision = precision_score(true_precision, pred_precision, zero_division=0)
-        recall = recall_score(true_recall, pred_recall, zero_division=0)
+        precision = precision_score(truth_precision, pred_precision, zero_division="warn")
+        recall = recall_score(truth_recall, pred_recall, zero_division="warn")
 
         f1 = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
 
         results.append((threshold, precision, recall, f1))
 
     return results
+
+
+# Helper function (ensure this is used in the apply calls above)
+def check_annotation_match(token_anns, target_anns):
+    if not isinstance(token_anns, (list, set)):
+        return 0
+    return 1 if any(ann in token_anns for ann in target_anns) else 0
+
 
 
 def preprocess_annotation_data_for_modrecall(token_df: pd.DataFrame, 
@@ -224,7 +228,8 @@ def preprocess_annotation_data_for_modrecall(token_df: pd.DataFrame,
         
         # Handle the case where token_annotations contains lists
         if isinstance(token_df['token_annotations'].iloc[0], list):
-            # Direct list comparison
+            #  if any of the annotations in the annotation list are present in the list of annotations for each token (x).
+            # If there's a match, the corresponding element in has_annotation is True; otherwise, it's False
             has_annotation = token_df['token_annotations'].apply(
                 lambda x: any(ann in x for ann in annotation)
             )
@@ -240,8 +245,7 @@ def preprocess_annotation_data_for_modrecall(token_df: pd.DataFrame,
 
     print("Annotation mask created. True count:", has_annotation.sum())
     
-    # Get highest activation tokens for annotated regions
-    # Important assumption here: an annotated region occurs only once per sequence and so we only take the highest activation token for each sequence
+    # For each seq_id, lets get the single most activating token with the target annotation
     high_act_tokens = (
         token_df[has_annotation]
         .groupby('seq_id')
@@ -253,12 +257,6 @@ def preprocess_annotation_data_for_modrecall(token_df: pd.DataFrame,
     combined_df = pd.concat([high_act_tokens, remaining_tokens])
 
     # Right before returning
-    print("About to return DataFrame")
-    print(f"Final DataFrame shape: {combined_df.shape}")
-    print(f"Final DataFrame column check: {f'latent-{latent_id}-act' in combined_df.columns}")
-    
-    print("Returning combined df...")
-    
     # Try adding explicit check of the result
     try:
         result = combined_df.copy()
@@ -350,9 +348,17 @@ def get_top_activations(batch_latents, top_n):
     return top_n_indices, top_n_values
 
 
-def analyze_single_latent(latent_id, batch_idx, top_k_indices, top_k_values, 
-                         annotations_list, tokens_array, excluded_annotations,
-                         min_threshold, latent_dict):
+def analyze_single_latent(
+    latent_id: int,
+    batch_idx: int,
+    top_k_indices: np.ndarray,
+    top_k_values: np.ndarray,
+    annotations_list: List[List[str]],
+    tokens_array: np.ndarray,
+    excluded_annotations: Set[str],
+    min_threshold: int,
+    latent_dict: Dict[int, Set[str]],
+) -> None:
     """Analyze a single latent unit and update results dictionary."""
     # Skip latents with zero activations
     if np.any(top_k_values[:, batch_idx] == 0):
@@ -402,34 +408,27 @@ def cleanup_memory(batch_latents, top_k_indices, top_k_values):
     torch.cuda.empty_cache()
     gc.collect()
 
-def safe_get_annotations(ann_entry):
-    """Helper function to safely process annotations"""
-    if isinstance(ann_entry, str):
-        try:
-            return eval(ann_entry)
-        except:
-            return []
-    return ann_entry
+def safe_get_annotations(ann_entry:list) -> list:
+    """
+    Safely processes annotation entries, ensuring they are lists of strings.
 
+    Args:
+        ann_entry: The annotation entry to process.
 
-"""
-def _parse_annotation_entry(entry):
-    if isinstance(entry, set):
-        # Convert set to list
-        annotation = list(entry)
-        thresholds = None
-    elif isinstance(entry, list):
-        # Use list directly
-        annotation = entry
-        # Check if third element exists and is numeric for threshold
-        thresholds = [entry[2]] if len(entry) > 2 and isinstance(entry[2], (int, float)) else None
+    Returns:
+        A list of strings, or an empty list if the input is invalid.
+    """
+    if isinstance(ann_entry, list):
+        # Check if all elements in the list are strings
+        if all(isinstance(item, str) for item in ann_entry):
+            return ann_entry
+        else:
+            print("Warning: Annotation list contains non-string elements.")
+            return []  # Return empty list if list contains non-strings
     else:
-        # Wrap single item in list
-        annotation = [entry] if entry else ["unknown"]
-        thresholds = None
-        
-    return annotation, thresholds
-"""
+        print("Warning: Annotation entry is not a list.")
+        return []  # Return empty list if input is not a list
+
 
 def _get_best_result(results, latent_id, annotation):
     """
@@ -462,35 +461,15 @@ def save_latent_results(results_df, output_path='latent_annotation_results.csv')
     print(f"Results saved to {output_path}")
     return output_path
 
-# turn results_df into a dict
-def results_df_to_dict(results_df):
-    """Convert results DataFrame to a dictionary."""
-    return results_df.set_index('latent_id').T.to_dict('list')
+def results_df_to_dict(results_df: pd.DataFrame) -> dict:
+    """
+    Converts a results DataFrame into a dictionary, where:
+    - Keys are unique 'latent_id' values.
+    - Values are lists of corresponding column values.
 
+    """
+    indexed_df = results_df.set_index('latent_id')  # Set 'latent_id' as index
+    transposed_df = indexed_df.T  # Transpose the DataFrame
+    result_dict = transposed_df.to_dict('list')  # Convert to dictionary
+    return result_dict
 
-
-if __name__ == '__main__':
-    
-    # Load the latent dictionary
-    latent_dict = pd.read_csv("/home/maiwald/Downloads/sae_for_glm/annotated_seqs/plasmidpretrainedNT_SAElatent_results_val012.csv")
-    latent_dict = latent_dict[['latent_id', 'annotation']].set_index('latent_id')['annotation'].to_dict()
-    print(latent_dict)
-
-    # Load the token df pkl file
-    token_df = pd.read_pickle("/home/maiwald/Downloads/sae_for_glm/annotated_seqs/token_df_1k_ss0_standardized.pkl")
-
-    # Generate random activations with similar mean/variance
-    fake_activations = np.random.normal(loc=2, scale=1, size=(len(token_df), 10))
-    fake_activations = torch.tensor(fake_activations)
-
-    # Get particular single latent, annotaiton pair
-    latent_id = 2
-    annotation = latent_dict[latent_id]
-
-    results = process_single_latent(latent_id, 
-                            [annotation], 
-                            fake_activations, 
-                            token_df, 
-                            compute_metrics_across_thresholds, 
-                            print_metrics, 
-                            0)
