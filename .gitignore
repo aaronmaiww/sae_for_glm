@@ -34,3 +34,4 @@ data/
 sae_weights/
 docs/
 notebooks/
+sae_for_glm.egg-info/
