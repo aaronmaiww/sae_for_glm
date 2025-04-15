@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.optim as optim
 import copy
 
-def load_token_dataframes(base_path, subset_indices=(0,)):
+def load_token_dataframes(base_path: str, subset_indices=(0,)):
     """Load and combine token dataframes for specified subsets.
 
     Args:
