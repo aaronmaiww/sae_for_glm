@@ -217,14 +217,19 @@ def get_seq_ids_from_token_data(token_data: Dict, subset_indices: Tuple[int, ...
         
     return flat_seq_ids
 
-def create_binary_labels(df, annotation_column, annotations, target_value=None):
-    """Create binary labels based on whether annotations contain any value from a list.
+
+def create_binary_labels(df: pd.DataFrame, 
+                         annotation_column: str, 
+                         annotations: List[str], 
+                         kmer: str = None) -> pd.Series:
+    """Create binary labels based on whether annotations contain any value from a list
+    or if a specific k-mer (target-value) is present in the tokens.
 
     Args:
         df (pd.DataFrame): DataFrame containing annotations
         annotation_column (str): Name of column containing annotations
         annotations (list or str): List of target annotations to search for
-        target_value (str, optional): Alternative target to search for (e.g., 'TAG')
+        kmer (str, optional): Alternative target to search for (e.g., 'TAG')
 
     Returns:
         pd.Series: Binary labels (0 or 1)
@@ -232,30 +237,38 @@ def create_binary_labels(df, annotation_column, annotations, target_value=None):
     # Convert single string annotation to list for consistent handling
     if isinstance(annotations, str):
         annotations = [annotations]
+
     elif not isinstance(annotations, list):
         raise ValueError("Annotations must be a string or list of strings")
 
+    # We label tokens based on either k-mers being present or annotations
     # If using token-based labeling
-    if target_value:
-        print(f"Using token-based labeling with target value: {target_value}")
-        return df['tokens'].apply(lambda x: 1 if target_value in x else 0)
+    if kmer:
+
+        print(f"Using token-based labeling with target value: {kmer}")
+        labels = df['tokens'].apply(lambda x: 1 if kmer in x else 0)
+
+    # Default: using annotation-based labeling
     else:
+
         print(f"Using annotation-based labeling with annotations: {annotations}")
-        
         # Fix for list-type annotation columns
         def check_for_annotation(annotation_list):
                 
             # Check if any annotation is a substring of any element in the list
-            return 1 if any(
+            label = 1 if any(
                 any(ann in list_item for list_item in annotation_list)
-                for ann in annotations
-            ) else 0
+                for ann in annotations) else 0
             
-        result = df[annotation_column].apply(check_for_annotation)
-        print(f"Found {result.sum()} positive examples")
-        return result
+            return label
+            
+        labels = df[annotation_column].apply(check_for_annotation)
 
-def compute_class_statistics(labels):
+
+    print(f"Found {labels.sum()} positive examples")
+    return labels
+
+def compute_class_statistics(labels: pd.Series) -> Dict[str, float]:
     """Compute basic statistics about class distribution.
 
     Args:
@@ -281,13 +294,13 @@ def compute_class_statistics(labels):
         'class_frequency': class_freq
     }
 
-def prepare_tensors(features, labels, device='cuda'):
+def prepare_tensors(features: torch.Tensor, 
+                    labels: pd.Series) -> Tuple[torch.Tensor, torch.Tensor]:
     """Prepare feature and label tensors for PyTorch training.
 
     Args:
         features (torch.Tensor): Input features
         labels (pd.Series): Binary labels
-        device (str): Target device for tensors
 
     Returns:
         tuple: (feature tensor, label tensor)
