@@ -1,16 +1,19 @@
 import pandas as pd
 import torch
+from torch import nn
+from torch import optim
 from tqdm import tqdm
-import utils
 from torch.utils.data import TensorDataset, DataLoader, Subset
 from sklearn.model_selection import StratifiedShuffleSplit
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-import torch.nn as nn
-import torch.optim as optim
 import copy
+import utils
+from typing import List, Dict, Any, Tuple, Optional
 
-def load_token_dataframes(base_path: str, subset_indices=(0,)):
-    """Load and combine token dataframes for specified subsets.
+
+def load_token_dataframes(base_path: str, subset_indices: Tuple =(0,)) -> Dict[str, Any]:
+    """Load and combine token dataframes of annotated, tokenized sequences that serve
+    as validation sets.
 
     Args:
         base_path (str): Base path to the directory containing token dataframes
@@ -36,7 +39,7 @@ def load_token_dataframes(base_path: str, subset_indices=(0,)):
         'sequence_ids': sequence_ids
     }
 
-def get_sequences_from_ids(test_data, seq_ids):
+def get_sequences_from_ids(test_data: pd.DataFrame, seq_ids: List[int]) -> pd.Series:
     """Extract sequences from test data using sequence IDs.
 
     Args:
@@ -46,21 +49,23 @@ def get_sequences_from_ids(test_data, seq_ids):
     Returns:
         pd.Series: Extracted sequences
     """
-    return test_data.iloc[seq_ids]['sequence']
+    df = test_data.iloc[seq_ids]['sequence']
+    return df
 
 def get_model_activations(
-    model,
-    tokenizer,
-    sequences,
-    layer_num,
-    batch_size=128,
-    max_length=512,
+    model: nn.Module,
+    tokenizer: Any,
+    sequences: List[str],
+    layer_num: int = 11,
+    batch_size: int = 128,
+    max_length: int = 512,
     device='cuda'
-):
-    """Get MLP activations for a set of sequences.
+) -> torch.Tensor:
+    
+    """Get MLP outputs for a set of sequences.
 
     Args:
-        model: Neural network model
+        model: In this case a transformer model (BERT-style)
         tokenizer: Tokenizer for processing sequences
         sequences (list): Input sequences
         layer_num (int): Layer to extract activations from
