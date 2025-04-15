@@ -28,9 +28,15 @@ def load_token_dataframes(base_path: str, subset_indices: Tuple =(0,)) -> Dict[s
     for idx in subset_indices:
         path = f"{base_path}/token_df_1k_ss{idx}_standardized.pkl"
         try:
+            # Load the dataframe and save it in the dictionary
             df = pd.read_pickle(path)
             dataframes[f's{idx}'] = df
-            sequence_ids[f's{idx}'] = sorted(list(set(df['seq_id'])))
+
+            # Extract unique sequence IDs, sort them, and save them in the dictionary
+            unique_seq_ids = set(df['seq_id'])
+            sorted_seq_ids = sorted(list(unique_seq_ids)) # ascending order
+            sequence_ids[f's{idx}'] = sorted_seq_ids
+
         except FileNotFoundError:
             raise FileNotFoundError(f"Token dataframe not found at {path}")
 
