@@ -145,19 +145,20 @@ def get_model_activations(
     return normalized_acts
 
 def prepare_probe_inputs(
-    test_data,
-    model,
-    tokenizer,
-    token_df_path,
-    layer_num=11,
-    subset_indices=(0,),
-    batch_size=128
-):
+    test_data: pd.DataFrame,
+    model: nn.Module,
+    tokenizer: Any,
+    token_df_path: str,
+    layer_num: int = 11,
+    subset_indices: tuple =(0,),
+    batch_size: int = 128
+) -> Dict[str, Any]:
+    
     """Prepare inputs for linear probe training.
 
     Args:
         test_data (pd.DataFrame): Test dataset
-        model: Neural network model
+        model: transformer model
         tokenizer: Tokenizer
         token_df_path (str): Path to token dataframes
         layer_num (int): Layer to extract activations from
@@ -167,15 +168,15 @@ def prepare_probe_inputs(
     Returns:
         dict: Processed inputs for probe training
     """
-    # Load token dataframes
+    # Load one or more dataframes of annotated, tokenized DNA sequences
     token_data = load_token_dataframes(token_df_path, subset_indices)
-
-    # Get sequences by first getting seq_ids for all subset indices
-    seq_ids = [token_data['sequence_ids'][f's{subset_indices[i]}'] for i in range(len(subset_indices))]
-    seq_ids = [item for sublist in seq_ids for item in sublist]
+    
+    # To get activations for each token in token_data, we need to get the 
+    # corresponding sequences they are from (stored in test_data)
+    seq_ids = get_seq_ids_from_token_data(token_data, subset_indices)
     sequences = get_sequences_from_ids(test_data, seq_ids)
 
-    # Get activations
+    # Get MLP-outputs at layer_num for the sequences
     activations = get_model_activations(
         model=model,
         tokenizer=tokenizer,
@@ -183,6 +184,7 @@ def prepare_probe_inputs(
         layer_num=layer_num,
         batch_size=batch_size
     )
+    # activations is a tensor of shape (n_tokens, hidden_dim)
 
     return {
         'activations': activations,
@@ -190,7 +192,30 @@ def prepare_probe_inputs(
         'sequences': sequences
     }
 
+def get_seq_ids_from_token_data(token_data: Dict, subset_indices: Tuple[int, ...]) -> List[str]:
+    """
+    Extract and flatten sequence IDs from token data for specified subsets.
+    
+    Args:
+        token_data: Dictionary containing sequence_ids
+        subset_indices: Tuple of subset indices to extract
+        
+    Returns:
+        List of flattened sequence IDs
+    """
+    # Extract sequence IDs for each subset
+    all_subset_ids = []
+    for i, subset_idx in enumerate(subset_indices):
+        subset_key = f's{subset_idx}'
+        subset_sequence_ids = token_data['sequence_ids'][subset_key]
+        all_subset_ids.append(subset_sequence_ids)
 
+    # Flatten the list of sequence IDs
+    flat_seq_ids = []
+    for subset_ids in all_subset_ids:
+        flat_seq_ids.extend(subset_ids)
+        
+    return flat_seq_ids
 
 def create_binary_labels(df, annotation_column, annotations, target_value=None):
     """Create binary labels based on whether annotations contain any value from a list.
