@@ -91,35 +91,40 @@ def get_model_activations(
         return_tensors="pt"
     )
 
-    # Calculate batching
+    # Calculate numb batches for progress bar
     total_tokens = tokens['input_ids'].shape[0] * tokens['input_ids'].shape[1]
     num_batches = (total_tokens + batch_size - 1) // batch_size
 
-    # Get activations
-    model.eval()
-    all_acts = []
+    all_acts = [] 
 
-
+    # We don't want to train the model, just get the activations
+    model.eval() 
     with torch.no_grad():
-        pbar = utils.tqdm(total=num_batches, desc="Processing batches")
+        pbar = tqdm(total=num_batches, desc="Processing batches")
         for i in range(num_batches):
             pbar.update(1)
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, total_tokens)
 
             # Prepare batch
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, total_tokens)
             batch_input_ids = tokens['input_ids'][start_idx:end_idx].to(device)
             batch_attention_mask = tokens['attention_mask'][start_idx:end_idx].to(device)
 
-            # Get activations
+            # Get MLP-outputs of model at layer_N
             mlp_act = utils.get_layer_activations(
                 model.to(device),
                 batch_input_ids,
                 batch_attention_mask,
                 layer_N=layer_num
             )
-            # reshape from list(tensor(a, b, c)) to tensor(a*b, c)
-            mlp_act = mlp_act[0].reshape(-1, model.config.hidden_size)
+
+            assert len(mlp_act) == 1, (
+                f"Expected 1 activation tensor, got {len(mlp_act)}"
+            )
+
+            # unnest & reshape to combine batch size and sequence length into a single dimension
+            mlp_act = mlp_act[0] # there's only a sinle tensor in the list
+            mlp_act = mlp_act.reshape(-1, model.config.hidden_size) # reshape tensor(batch_s, seq_len, hidden_d) to tensor(batch_s*seq_len, hidden_d)
 
             # Verify shape
             expected_shape = batch_input_ids.shape[0] * batch_input_ids.shape[1]
@@ -130,11 +135,11 @@ def get_model_activations(
 
             all_acts.append(mlp_act)
 
-    # Process results
+    # Move activations to CPU and concatenate to one torch.Tensor
     all_acts = [x.cpu() for x in all_acts]
-    activations = torch.cat(all_acts, dim=0).cpu()
+    activations = torch.cat(all_acts, dim=0)
 
-    # Normalize
+    # Normalize all activation vectors
     normalized_acts = (activations - activations.mean(dim=0)) / activations.std(dim=0)
 
     return normalized_acts
