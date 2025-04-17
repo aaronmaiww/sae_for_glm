@@ -45,35 +45,23 @@ def load_token_dataframes(base_path: str, subset_indices: Tuple =(0,)) -> Dict[s
         'sequence_ids': sequence_ids
     }
 
-def get_sequences_from_ids(test_data: pd.DataFrame, seq_ids: List[int]) -> pd.Series:
-    """Extract sequences from test data using sequence IDs.
-
-    Args:
-        test_data (pd.DataFrame): Full test dataset
-        seq_ids (list): List of sequence IDs to extract
-
-    Returns:
-        pd.Series: Extracted sequences
-    """
-    df = test_data.iloc[seq_ids]['sequence']
-    return df
 
 def get_model_activations(
     model: nn.Module,
     tokenizer: Any,
-    sequences: List[str],
+    sequences: pd.Series,
     layer_num: int = 11,
     batch_size: int = 128,
     max_length: int = 512,
     device='cuda'
 ) -> torch.Tensor:
     
-    """Get MLP outputs for a set of sequences.
+    """Get MLP outputs for a set of input sequences.
 
     Args:
         model: In this case a transformer model (BERT-style)
         tokenizer: Tokenizer for processing sequences
-        sequences (list): Input sequences
+        sequences (pd.Series): Input sequences
         layer_num (int): Layer to extract activations from
         batch_size (int): Processing batch size
         max_length (int): Maximum sequence length
@@ -91,28 +79,30 @@ def get_model_activations(
         return_tensors="pt"
     )
 
-    # Calculate numb batches for progress bar
-    total_tokens = tokens['input_ids'].shape[0] * tokens['input_ids'].shape[1]
-    num_batches = (total_tokens + batch_size - 1) // batch_size
+    # Calculate num batches for progress bar
+    n_seqs, _ = tokens["input_ids"].shape
+    total_batches = (n_seqs + batch_size - 1) // batch_size
 
     all_acts = [] 
 
     # We don't want to train the model, just get the activations
+    model.to(device)
     model.eval() 
     with torch.no_grad():
-        pbar = tqdm(total=num_batches, desc="Processing batches")
-        for i in range(num_batches):
+
+        pbar = tqdm(total = total_batches, desc = "Processing batches")
+
+        for i in range(0, n_seqs, batch_size):
+            # Update progress bar
             pbar.update(1)
 
-            # Prepare batch
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, total_tokens)
-            batch_input_ids = tokens['input_ids'][start_idx:end_idx].to(device)
-            batch_attention_mask = tokens['attention_mask'][start_idx:end_idx].to(device)
-
+            # Get batch of input IDs and attention masks
+            batch_input_ids = tokens['input_ids'][i:i + batch_size].to(device)
+            batch_attention_mask = tokens['attention_mask'][i:i + batch_size].to(device)
+    
             # Get MLP-outputs of model at layer_N
             mlp_act = utils.get_layer_activations(
-                model.to(device),
+                model,
                 batch_input_ids,
                 batch_attention_mask,
                 layer_N=layer_num
@@ -124,7 +114,8 @@ def get_model_activations(
 
             # unnest & reshape to combine batch size and sequence length into a single dimension
             mlp_act = mlp_act[0] # there's only a sinle tensor in the list
-            mlp_act = mlp_act.reshape(-1, model.config.hidden_size) # reshape tensor(batch_s, seq_len, hidden_d) to tensor(batch_s*seq_len, hidden_d)
+            mlp_flat_act = mlp_act.reshape(-1, model.config.hidden_size) # reshape tensor(batch_s, seq_len, hidden_d) to tensor(batch_s*seq_len, hidden_d)
+            mlp_flat_act = mlp_flat_act.detach().cpu() # move to CPU
 
             # Verify shape
             expected_shape = batch_input_ids.shape[0] * batch_input_ids.shape[1]
@@ -133,14 +124,16 @@ def get_model_activations(
                 f"expected shape {expected_shape}"
             )
 
-            all_acts.append(mlp_act)
+            all_acts.append(mlp_flat_act)
+        
+        pbar.close()
 
-    # Move activations to CPU and concatenate to one torch.Tensor
-    all_acts = [x.cpu() for x in all_acts]
+    # Concatenate acts to one torch.Tensor
     activations = torch.cat(all_acts, dim=0)
 
     # Normalize all activation vectors
-    normalized_acts = (activations - activations.mean(dim=0)) / activations.std(dim=0)
+    std = activations.std(dim=0).clamp(min=1e-6) # avoid division by zero
+    normalized_acts = (activations - activations.mean(dim = 0)) / std
 
     return normalized_acts
 
@@ -174,7 +167,7 @@ def prepare_probe_inputs(
     # To get activations for each token in token_data, we need to get the 
     # corresponding sequences they are from (stored in test_data)
     seq_ids = get_seq_ids_from_token_data(token_data, subset_indices)
-    sequences = get_sequences_from_ids(test_data, seq_ids)
+    sequences = test_data.iloc[seq_ids]['sequence']
 
     # Get MLP-outputs at layer_num for the sequences
     activations = get_model_activations(
@@ -246,7 +239,7 @@ def create_binary_labels(df: pd.DataFrame,
     if kmer:
 
         print(f"Using token-based labeling with target value: {kmer}")
-        labels = df['tokens'].apply(lambda x: 1 if kmer in x else 0)
+        labels = df['tokens'].apply(lambda x: 1 if kmer in x else 0).astype(int)
 
     # Default: using annotation-based labeling
     else:
@@ -277,6 +270,7 @@ def compute_class_statistics(labels: pd.Series) -> Dict[str, float]:
     Returns:
         dict: Statistics including positive count, base rate accuracy, class frequency
     """
+    # First, handle edge case where all labels are negative
     positive_count = labels.sum()
     if positive_count == 0:
         return {
@@ -285,6 +279,7 @@ def compute_class_statistics(labels: pd.Series) -> Dict[str, float]:
             'class_frequency': 0
         }
 
+    # Calc accuracy achieved by always predicting the majority class ('base rate accuracy')
     class_freq = positive_count / len(labels)
     base_rate_acc = max(class_freq, 1 - class_freq)
 
@@ -305,17 +300,24 @@ def prepare_tensors(features: torch.Tensor,
     Returns:
         tuple: (feature tensor, label tensor)
     """
-    x_tensor = features.clone().detach().to(dtype=torch.float32)
+    # Detach activation values from computation graph & convert labels to tensor
+    x_tensor = features.clone().detach().to(dtype=torch.float32) # also convert to float32, in case of mixed precision
     y_tensor = torch.tensor(labels.values, dtype=torch.float32)
 
     return x_tensor, y_tensor
 
-def process_annotation(df, xs, target_value =None, annotation='CMV enhancer', annotation_column='token_annotations'):
+def process_annotation(df: pd.DataFrame,
+                        xs: torch.Tensor,
+                        target_value: str = None,
+                        annotation: str ='CMV enhancer', 
+                        annotation_column: str ='token_annotations') -> Dict[str, Any]:
+
     """Process a single annotation and prepare data for training.
 
     Args:
         df (pd.DataFrame): Input DataFrame with annotations
         xs (torch.Tensor): Feature tensor
+        target_value (str): kmer for token-based labeling 
         annotation (str): Target annotation
         annotation_column (str): Column containing annotations
 
@@ -343,175 +345,62 @@ def process_annotation(df, xs, target_value =None, annotation='CMV enhancer', an
     }
 
 
-def generate_shuffled_label_matrix(original_labels, num_probes, real_probe_idx=0):
+def generate_shuffled_label_matrix(original_labels: torch.Tensor, 
+                                    num_probes: int, 
+                                    real_probe_indices: list = [0]) -> torch.Tensor:
     """Generate matrix of shuffled labels for multiple probes
     
     Args:
-        original_labels (torch.Tensor): Original binary labels [n_samples]
+        original_labels (torch.Tensor or list of torch.Tensor): Original binary labels
+            If a single tensor [n_samples], will use the same labels for all real probes
+            If a list of tensors, each element corresponds to different real labels
         num_probes (int): Number of probes to generate labels for
-        real_probe_idx (int): Index of the probe to use real (unshuffled) labels
+        real_probe_indices (list or None): Indices of probes to use real (unshuffled) labels
+            If None, only the first probe (index 0) will use real labels
         
     Returns:
         torch.Tensor: Label matrix [n_samples, num_probes]
     """
-    n_samples = original_labels.size(0)
+    # Default to only first probe having real labels
+    if real_probe_indices is None:
+        real_probe_indices = [0]
+    
+    # If original_labels is a single tensor, use it for all real probes
+    if not isinstance(original_labels, list):
+        original_labels = [original_labels] * len(real_probe_indices)
+    
+    # Ensure we have the right number of label sets
+    assert len(original_labels) == len(real_probe_indices), "Number of label sets must match number of real probe indices"
+    
+    # Get dimensions
+    n_samples = original_labels[0].size(0)
     label_matrix = torch.zeros(n_samples, num_probes)
     
-    # Set the real labels for one probe
-    label_matrix[:, real_probe_idx] = original_labels
-    
-    # Create shuffled versions for all other probes
+    # First, shuffle all labels
     for i in range(num_probes):
-        if i == real_probe_idx:
-            continue
         # Get shuffled indices while preserving class distribution
         shuffled_indices = torch.randperm(n_samples)
-        label_matrix[:, i] = original_labels[shuffled_indices]
+        label_matrix[:, i] = original_labels[0][shuffled_indices]
+    
+    # Then set the real labels for specified probes
+    for idx, probe_idx in enumerate(real_probe_indices):
+        label_matrix[:, probe_idx] = original_labels[idx]
     
     return label_matrix
 
 
 
-#Training Classes
-class ProbeTrainer:
-    def __init__(self, model, config, loss_weight = None):
-        self.model = model
-        self.config = config
-        self.criterion = nn.BCEWithLogitsLoss() if loss_weight is None else nn.BCEWithLogitsLoss(pos_weight=loss_weight) ## acounting for class imb
-        self.optimizer = optim.Adam(
-            model.parameters(),
-            lr=config['learning_rate'],
-            weight_decay=config['weight_decay']
-        )
-        # Early stopping parameters
-        self.patience = 5  # Number of epochs to wait for improvement
-        self.min_delta = 1e-4  # Minimum change in validation F1 to qualify as an improvement
-
-
-    def create_data_loaders(self, x_tensor, y_tensor):
-        """Create train and validation data loaders with stratified split"""
-        dataset = TensorDataset(x_tensor, y_tensor)
-
-
-        sss = StratifiedShuffleSplit(
-            n_splits=1,
-            test_size=1-self.config['train_split'],
-            random_state=self.config['random_seed']
-        )
-        train_idx, val_idx = next(sss.split(x_tensor, y_tensor))
-
-        train_dataset = Subset(dataset, train_idx)
-        val_dataset = Subset(dataset, val_idx)
-
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.config['batch_size'],
-            shuffle=True
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.config['batch_size'],
-            shuffle=False
-        )
-
-        return train_loader, val_loader
-
-    def train_epoch(self, train_loader):
-        """Train for one epoch"""
-        self.model.train()
-        self.model.cuda() if torch.cuda.is_available() else self.model.cpu()
-        train_loss = 0.0
-
-        for inputs, targets in train_loader:
-            self.optimizer.zero_grad()
-            outputs = self.model(inputs.cuda())
-            loss = self.criterion(outputs.squeeze().cpu(), targets)
-            loss.backward()
-            self.optimizer.step()
-            train_loss += loss.item()
-
-        return train_loss / len(train_loader)
-
-    def evaluate(self, val_loader):
-        """Evaluate model on validation set"""
-        self.model.eval()
-        val_loss = 0.0
-        all_preds = []
-        all_targets = []
-
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                outputs = self.model(inputs.cuda())
-                loss = self.criterion(outputs.squeeze().cpu(), targets)
-                val_loss += loss.item()
-                preds = torch.round(torch.sigmoid(outputs))
-                all_preds.extend(preds.cpu().numpy())
-                all_targets.extend(targets.cpu().numpy())
-
-        metrics = {
-            'loss': val_loss / len(val_loader),
-            'accuracy': accuracy_score(all_targets, all_preds),
-            'precision': precision_score(all_targets, all_preds),
-            'recall': recall_score(all_targets, all_preds),
-            'f1': f1_score(all_targets, all_preds)
-        }
-
-        return metrics
-
-    def train(self, x_tensor, y_tensor, verbose = True):
-        """Full training loop with validation and early stopping"""
-        train_loader, val_loader = self.create_data_loaders(x_tensor, y_tensor)
-        best_f1 = 0.0
-        best_metrics = None
-        best_model_state = None
-        patience_counter = 0
-
-        for epoch in range(self.config['num_epochs']):
-            train_loss = self.train_epoch(train_loader)
-            metrics = self.evaluate(val_loader)
-
-            # Check if current F1 score is better than best F1
-            if metrics['f1'] > best_f1 + self.min_delta:
-                best_f1 = metrics['f1']
-                best_metrics = metrics
-                best_model_state = copy.deepcopy(self.model.state_dict())
-                patience_counter = 0
-            else:
-                patience_counter += 1
-
-            if verbose:
-                print(f"Epoch {epoch+1}/{self.config['num_epochs']}")
-                print(f"Train Loss: {train_loss:.4f}")
-                print(f"Val Metrics: {metrics}")
-                print(f"Best F1: {best_f1:.4f}")
-                print(f"Patience Counter: {patience_counter}/{self.patience}")
-
-            # Early stopping check
-            if patience_counter >= self.patience:
-                print(f"Early stopping triggered after {epoch+1} epochs")
-                break
-
-        # Restore best model
-        if best_model_state is not None:
-            self.model.load_state_dict(best_model_state)
-
-        print("Training complete")
-        print(f"Best F1: {best_f1:.4f}")
-        print(f"Best Metrics: {best_metrics}")
-
-        return best_metrics
-
-
-
-
+# Training Class
 class BatchProbeTrainer:
+
     def __init__(self, num_probes: int, input_dim: int, config: dict, loss_weights=None):
         """Initialize trainer for multiple probes at once"""
         self.config = config
         self.num_probes = num_probes
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Create a single linear layer with multiple outputs
+        # Create a single linear layer classifier for all probes
+        # each column of the weight matrix and each output corresponds to a probe 
         self.model = nn.Linear(input_dim, num_probes).to(self.device)
             
         # Handle class imbalance with probe-specific weights
@@ -531,7 +420,10 @@ class BatchProbeTrainer:
         self.patience = 5
         self.min_delta = 1e-4
 
-    def create_data_loaders(self, x_tensor, y_tensor_matrix):
+    def create_data_loaders(self, 
+                            x_tensor: torch.Tensor, 
+                            y_tensor_matrix: torch.Tensor) -> Tuple[DataLoader, DataLoader]:
+
         """Create train and validation data loaders with stratified split"""
         # Move tensors to CPU for dataset creation (DataLoader will handle device transfer)
         x_cpu = x_tensor.cpu()
@@ -563,7 +455,7 @@ class BatchProbeTrainer:
         
         return train_loader, val_loader
 
-    def train_epoch(self, train_loader):
+    def train_epoch(self, train_loader) -> float:
         """Train all probes for one epoch"""
         self.model.train()
         train_loss = 0.0
@@ -582,7 +474,7 @@ class BatchProbeTrainer:
             
         return train_loss / len(train_loader)
 
-    def evaluate(self, val_loader):
+    def evaluate(self, val_loader) -> Dict[str, Any]:
         """Evaluate all probes on validation set"""
         self.model.eval()
         val_loss = 0.0
@@ -627,7 +519,10 @@ class BatchProbeTrainer:
             'avg_f1': sum(m['f1'] for m in metrics) / len(metrics)
         }
 
-    def train(self, x_tensor, y_tensor_matrix, verbose=True):
+    def train(self, 
+             x_tensor: torch.Tensor, 
+             y_tensor_matrix: torch.Tensor,
+             verbose: bool = True) -> Dict[str, Any]:
         """Train all probes with early stopping based on average F1"""
         
         train_loader, val_loader = self.create_data_loaders(x_tensor, y_tensor_matrix)
