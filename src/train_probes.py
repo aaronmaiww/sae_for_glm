@@ -81,7 +81,7 @@ def get_model_activations(
 
     # Calculate num batches for progress bar
     n_seqs, _ = tokens["input_ids"].shape
-    total_batches = (n_seqs + batch_size - 1) // batch_size
+    total_batches = (n_seqs + batch_size - 1) // batch_size # round up (n_seqs / batch_size)
 
     all_acts = [] 
 
@@ -119,8 +119,8 @@ def get_model_activations(
 
             # Verify shape
             expected_shape = batch_input_ids.shape[0] * batch_input_ids.shape[1]
-            assert mlp_act.shape[0] == expected_shape, (
-                f"MLP activation shape {mlp_act.shape[0]} does not match "
+            assert mlp_flat_act.shape[0] == expected_shape, (
+                f"MLP activation shape {mlp_flat_act.shape[0]} does not match "
                 f"expected shape {expected_shape}"
             )
 
@@ -328,7 +328,7 @@ def process_annotation(df: pd.DataFrame,
         ValueError: If no positive examples found for annotation
     """
     # Create labels
-    labels = create_binary_labels(df, annotation_column, annotation, target_value=target_value)
+    labels = create_binary_labels(df, annotation_column, annotation, kmer = target_value)
 
     # Compute statistics
     stats = compute_class_statistics(labels)
