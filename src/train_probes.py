@@ -347,7 +347,7 @@ def process_annotation(df: pd.DataFrame,
 
 def generate_shuffled_label_matrix(original_labels: torch.Tensor, 
                                     num_probes: int, 
-                                    real_probe_indices: list = [0]) -> torch.Tensor:
+                                    real_probe_indices: list = None) -> torch.Tensor:
     """Generate matrix of shuffled labels for multiple probes
     
     Args:
@@ -512,21 +512,29 @@ class BatchProbeTrainer:
                 'recall': recall_score(probe_targets, probe_preds),
                 'f1': f1_score(probe_targets, probe_preds)
             })
+
+        # Calculate best F1 score across all probes
+        best_f1 = max(m['f1'] for m in metrics)
+        best_probe_idx = max(range(len(metrics)), key=lambda i: metrics[i]['f1'])
             
         return {
             'loss': val_loss / len(val_loader),
             'probe_metrics': metrics,
-            'avg_f1': sum(m['f1'] for m in metrics) / len(metrics)
+            'avg_f1': sum(m['f1'] for m in metrics) / len(metrics),  # Keep for backward compatibility
+            'best_f1': best_f1,
+            'best_probe_idx': best_probe_idx
         }
+            
+
 
     def train(self, 
              x_tensor: torch.Tensor, 
              y_tensor_matrix: torch.Tensor,
              verbose: bool = True) -> Dict[str, Any]:
-        """Train all probes with early stopping based on average F1"""
+        """Train all probes with early stopping based on best F1"""
         
         train_loader, val_loader = self.create_data_loaders(x_tensor, y_tensor_matrix)
-        best_avg_f1 = 0.0
+        best_f1_score = 0.0
         best_metrics = None
         best_model_state = None
         patience_counter = 0
@@ -539,9 +547,9 @@ class BatchProbeTrainer:
             train_loss = self.train_epoch(train_loader)
             metrics = self.evaluate(val_loader)
             
-            # Check if average F1 is better
-            if metrics['avg_f1'] > best_avg_f1 + self.min_delta:
-                best_avg_f1 = metrics['avg_f1']
+            # Check if best F1 is better (using best_f1 instead of avg_f1)
+            if metrics['best_f1'] > best_f1_score + self.min_delta:
+                best_f1_score = metrics['best_f1']
                 best_metrics = metrics
                 best_model_state = copy.deepcopy(self.model.state_dict())
                 patience_counter = 0
@@ -552,7 +560,8 @@ class BatchProbeTrainer:
             pbar.set_postfix({
                 'loss': f"{train_loss:.4f}",
                 'val_loss': f"{metrics['loss']:.4f}", 
-                'f1': f"{metrics['avg_f1']:.4f}",
+                'avg_f1': f"{metrics['avg_f1']:.4f}",
+                'best_f1': f"{metrics['best_f1']:.4f}",  # Update display
                 'patience': f"{patience_counter}/{self.patience}"
             })
             pbar.update(1)
@@ -561,7 +570,7 @@ class BatchProbeTrainer:
             if verbose and epoch % 5 == 0:  # Show detailed metrics every 5 epochs
                 print(f"\nEpoch {epoch+1}/{self.config['num_epochs']}:")
                 print(f"Train Loss: {train_loss:.4f}, Val Loss: {metrics['loss']:.4f}")
-                print(f"Avg F1: {metrics['avg_f1']:.4f}, Best F1: {best_avg_f1:.4f}")
+                print(f"Avg F1: {metrics['avg_f1']:.4f}, Best F1: {metrics['best_f1']:.4f}")
             
             # Early stopping check
             if patience_counter >= self.patience:
@@ -577,7 +586,8 @@ class BatchProbeTrainer:
             self.model.load_state_dict(best_model_state)
         
         if verbose:
-            print(f"Training complete. Best avg F1: {best_avg_f1:.4f}")
+            print(f"Training complete. Best F1: {best_f1_score:.4f} (Probe {best_metrics['best_probe_idx']})")
+
         
         # Extract individual probe weights
         probe_weights = self.model.weight.data
